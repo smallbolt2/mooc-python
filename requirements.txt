@@ -1,7 +1,68 @@
-flask==2.0.1
+# ==========================================
+# 核心 Web 框架（已适配 Python 3.14）
+# ==========================================
+Flask==3.1.3
+Werkzeug==3.1.9
+Flask-SocketIO==5.7.0
+python-socketio==5.17.0
+python-engineio==4.14.0
+simple-websocket==1.1.0
+bidict==0.24.1
+blinker==1.9.0
+click==8.5.0
+itsdangerous==2.2.0
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+
+# ==========================================
+# HTTP / 网络请求
+# ==========================================
 requests==2.26.0
+urllib3==1.26.20
+certifi==2026.10.19
+charset-normalizer==2.0.12
+idna==3.20
+
+# ==========================================
+# 验证码识别（ddddocr 原 requirements 缺失）
+# ==========================================
+ddddocr==1.6.1
+onnxruntime==1.31.0
+numpy==2.5.4
+opencv-python==5.0.0.93
+pillow==13.0.0
+flatbuffers==25.12.19
+protobuf==7.36.2
+packaging==26.3
+
+# ==========================================
+# 数据库 / 表单 / 会话（保留自原 requirements）
+# ==========================================
+Flask-SQLAlchemy==2.5.1
+SQLAlchemy==2.1.6
+Flask-Login==0.5.0
 python-dotenv==0.19.0
-flask-sqlalchemy==2.5.1
-flask-login==0.5.0
+
+# ==========================================
+# 浏览器自动化（保留自原 requirements）
+# ==========================================
 selenium==4.1.0
-flask-socketio==5.1.1 
+trio==0.34.0
+trio-websocket==0.12.2
+wsproto==1.3.2
+h11==0.16.0
+sniffio==1.3.1
+attrs==26.1.0
+outcome==1.3.0.post0
+sortedcontainers==2.4.0
+
+# ==========================================
+# 其他依赖
+# ==========================================
+cffi==2.1.1
+pycparser==3.12
+cryptography==50.0.2
+pyOpenSSL==26.4.0
+urllib3-secure-extra==0.1.0
+typing_extensions==4.16.0
+colorama==0.4.6

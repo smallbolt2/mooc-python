@@ -533,13 +533,287 @@ body {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 1rem;
     margin-bottom: 1rem;
+}
+
+.user-controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 0.35rem;
+}
+
+.user-controls .btn-sm {
+    min-height: 32px;
+    margin: 0 !important;
+    border: 0;
+    border-radius: 6px;
+    color: #fff;
+}
+
+.btn-node-parallel {
+    background: #0f766e;
+}
+
+.btn-node-parallel:hover:not(:disabled) {
+    background: #115e59;
+}
+
+.parallel-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 2100;
+    padding: 24px;
+    overflow-y: auto;
+    background: rgba(15, 23, 42, 0.68);
+}
+
+.parallel-dialog {
+    width: min(680px, 100%);
+    max-height: calc(100vh - 48px);
+    margin: 24px auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #fff;
+    color: #1e293b;
+    border-radius: 8px;
+    box-shadow: 0 20px 50px rgba(15, 23, 42, 0.28);
+}
+
+.parallel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 20px 24px;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.parallel-header h2 {
+    margin: 0;
+    font-size: 1.2rem;
+    font-weight: 600;
+}
+
+.parallel-header h2 i {
+    color: #0f766e;
+    margin-right: 8px;
+}
+
+.parallel-icon-btn {
+    width: 36px;
+    height: 36px;
+    flex: 0 0 36px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: #64748b;
+    font-size: 1.1rem;
+}
+
+.parallel-icon-btn:hover {
+    background: #f1f5f9;
+    color: #1e293b;
+}
+
+#parallelForm {
+    padding: 20px 24px 24px;
+    overflow-y: auto;
+}
+
+.parallel-account {
+    margin-bottom: 18px;
+    color: #475569;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.parallel-account i {
+    color: #3b82f6;
+    margin-right: 6px;
+}
+
+.parallel-course-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.parallel-link-btn {
+    padding: 4px;
+    border: 0;
+    background: transparent;
+    color: #0f766e;
+}
+
+.parallel-link-btn:hover {
+    text-decoration: underline;
+}
+
+.parallel-course-list {
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid #e2e8f0;
+    border-radius: 6px;
+}
+
+.parallel-course-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 190px;
+    align-items: center;
+    gap: 14px;
+    min-height: 64px;
+    padding: 10px 14px;
+    border-bottom: 1px solid #e2e8f0;
+}
+
+.parallel-course-row:last-child {
+    border-bottom: 0;
+}
+
+.parallel-course-check {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    min-width: 0;
+    cursor: pointer;
+}
+
+.parallel-course-check input {
+    width: 17px;
+    height: 17px;
+    flex: 0 0 17px;
+    margin: 2px 0 0;
+    accent-color: #0f766e;
+}
+
+.parallel-course-name {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: 0.92rem;
+}
+
+.parallel-course-progress {
+    display: block;
+    margin-top: 3px;
+    color: #64748b;
+    font-size: 0.78rem;
+}
+
+.parallel-course-mode {
+    width: 100%;
+    min-height: 36px;
+    padding: 6px 28px 6px 9px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    background: #fff;
+    color: #334155;
+    font-size: 0.85rem;
+}
+
+.parallel-course-mode:disabled {
+    background: #f1f5f9;
+    color: #94a3b8;
+}
+
+.parallel-limits {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-top: 20px;
+}
+
+.parallel-limits label {
+    display: block;
+    margin-bottom: 7px;
+    color: #475569;
+    font-size: 0.86rem;
+    font-weight: 500;
+}
+
+.parallel-limits input {
+    width: 100%;
+    height: 40px;
+    padding: 7px 10px;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    color: #1e293b;
+}
+
+.parallel-limits input:focus,
+.parallel-course-mode:focus {
+    outline: 2px solid rgba(15, 118, 110, 0.22);
+    border-color: #0f766e;
+}
+
+.parallel-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 24px;
+}
+
+.parallel-actions button {
+    min-height: 40px;
+    padding: 8px 18px;
+    border-radius: 6px;
+}
+
+.parallel-cancel-btn {
+    border: 1px solid #cbd5e1;
+    background: #fff;
+    color: #475569;
+}
+
+.parallel-start-btn {
+    border: 1px solid #0f766e;
+    background: #0f766e;
+    color: #fff;
+}
+
+.parallel-start-btn:disabled {
+    opacity: 0.6;
+}
+
+.parallel-placeholder,
+.parallel-load-error {
+    padding: 24px 16px;
+    color: #64748b;
+    text-align: center;
+}
+
+.parallel-load-error {
+    border: 1px solid #fecaca;
+    border-radius: 6px;
+    background: #fef2f2;
+    color: #b91c1c;
+}
+
+.parallel-load-error .parallel-link-btn {
+    display: block;
+    margin: 6px auto 0;
+    color: #b91c1c;
 }
 
 .user-name {
     font-size: 1.1rem;
     font-weight: 600;
     color: #1e293b;
+}
+
+.user-site {
+    display: inline-block;
+    margin-left: 0.55rem;
+    color: #64748b;
+    font-size: 0.78rem;
+    font-weight: 400;
+    overflow-wrap: anywhere;
 }
 
 .user-status {
@@ -644,6 +918,39 @@ body {
     
     .tab-content {
         padding: 1rem;
+    }
+
+    .user-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .user-controls {
+        justify-content: flex-start;
+    }
+
+    .parallel-modal {
+        padding: 12px;
+    }
+
+    .parallel-dialog {
+        max-height: calc(100vh - 24px);
+        margin: 0 auto;
+    }
+
+    .parallel-header,
+    #parallelForm {
+        padding-left: 16px;
+        padding-right: 16px;
+    }
+
+    .parallel-course-row {
+        grid-template-columns: 1fr;
+        gap: 9px;
+    }
+
+    .parallel-limits {
+        grid-template-columns: 1fr;
     }
 }
 

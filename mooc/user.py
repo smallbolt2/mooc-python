@@ -10,6 +10,30 @@ from typing import List, Dict, Optional
 import threading
 from queue import Queue
 import concurrent.futures
+import io
+import contextlib
+
+
+def create_ocr():
+    """静默创建 ddddocr 实例，避免导入时输出广告信息。"""
+    try:
+        import ddddocr
+        if getattr(ddddocr.DdddOcr, '_mooc_silent_patch', False) is False:
+            original_init = ddddocr.DdddOcr.__init__
+
+            def silent_init(self, *args, **kwargs):
+                kwargs.setdefault('show_ad', False)
+                return original_init(self, *args, **kwargs)
+
+            ddddocr.DdddOcr.__init__ = silent_init
+            ddddocr.DdddOcr._mooc_silent_patch = True
+    except Exception:
+        pass
+
+    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        import ddddocr
+    return ddddocr.DdddOcr(show_ad=False)
+
 
 class User:
     def __init__(self, base_url: str, school_id: int, username: str, password: str, study_limit: int = 3):
@@ -45,7 +69,10 @@ class User:
         self.study_queue = Queue()  # 课程学习队列
         self.study_threads = []  # 学习线程列表
         self.study_lock = threading.Lock()  # 线程锁
+        self.status_lock = threading.Lock()
         self.active_courses = set()  # 当前正在学习的课程ID集合
+        self.active_videos = {}
+        self.run_mode = 'normal'
 
     def setup_logging(self):
         logging.basicConfig(
@@ -57,6 +84,15 @@ class User:
     def update_status(self, status: str):
         self.current_status = status
         self.logger.info(f"状态更新: {status}")
+
+    def _set_video_active(self, node_id, node_name, active: bool):
+        """记录并行节点，避免多个线程互相覆盖当前视频。"""
+        with self.status_lock:
+            if active:
+                self.active_videos[str(node_id)] = node_name
+            else:
+                self.active_videos.pop(str(node_id), None)
+            self.current_video = '、'.join(self.active_videos.values()) or None
 
     def login(self) -> bool:
         """登录系统"""
@@ -88,8 +124,7 @@ class User:
                     return False
                 
                 # 使用 ddddocr 识别验证码
-                import ddddocr
-                ocr = ddddocr.DdddOcr()
+                ocr = create_ocr()
                 code = ocr.classification(code_response.content)
                 self.logger.info(f"登录验证码识别成功: {code}")
                 
@@ -333,18 +368,24 @@ class User:
                 return "error"
             
             study_total = progress_data.get('study_total', {})
-            if not study_total:
+            if study_total:
+                state = str(study_total.get('state', ''))
+                if state == "2":
+                    return "completed"
+                if state == "1":
+                    return "unlocked"
+                if state == "0":
+                    return "locked"
                 return "error"
-            
-            state = study_total.get('state')
-            if state == "2":
+
+            if str(node.get('videoState', '')) == '2':
                 return "completed"
-            elif state == "1":
+
+            # 未学习过的节点返回空 study_total，不代表被前置节点锁定。
+            # 课程明确标记 nodeLock=0 时，所有子节点都可以立即并行。
+            if node.get('nodeLock') in (0, '0', False):
                 return "unlocked"
-            elif state == "0":
-                return "locked"
-            else:
-                return "error"
+            return "error"
                 
         except Exception as e:
             self.logger.error(f"检查视频状态失败: {str(e)}")
@@ -352,8 +393,10 @@ class User:
 
     def study_node(self, node: Dict) -> bool:
         """学习视频节点，完全匹配Go版本的实现"""
+        if not self.running:
+            return False
         start_study = True
-        while start_study:
+        while start_study and self.running:
             try:
                 node_id = node.get('id')
                 if not node_id:
@@ -386,7 +429,7 @@ class User:
                     return False
                     
                 # 如果已经完成，直接返回
-                if study_total.get('state') == "2":
+                if str(study_total.get('state', '')) == "2":
                     self.update_status(f"视频已完成: {node_name}")
                     return True
                 
@@ -399,7 +442,7 @@ class User:
                 # 启动进度监控协程
                 def monitor_progress():
                     nonlocal node_progress, flag
-                    while flag:
+                    while flag and self.running:
                         try:
                             progress = self.get_node_progress(node_id)
                             if not progress:
@@ -417,11 +460,11 @@ class User:
                                 }
                                 progress['study_total'] = study_total
                                 
-                            if study_total.get('state') == "2":
+                            if str(study_total.get('state', '')) == "2":
                                 node['video_state'] = 2
                                 break
                             node_progress = progress
-                            time.sleep(10)
+                            self._interruptible_sleep(10)
                         except Exception as e:
                             self.logger.error(f"监控进度异常: {str(e)}")
                             flag = False
@@ -432,7 +475,7 @@ class User:
                 monitor_thread.daemon = True
                 monitor_thread.start()
                 
-                while node.get('video_state') != 2:
+                while node.get('video_state') != 2 and self.running:
                     if not flag:
                         # 使用goto startStudy的逻辑
                         start_study = True
@@ -484,11 +527,12 @@ class User:
                                 study_data['code'] = code + "_"
                                 self.logger.info(f"验证码处理完成: {code}")
                                 continue
-                            # 如果是未解锁错误，继续尝试学习
+                            # 并行任务遇到前置限制时结束该节点，交由课程调度器处理。
                             if "未解锁" in error_msg or "未开始" in error_msg:
-                                self.logger.warning(f"视频可能未解锁，继续尝试: {error_msg}")
-                                time.sleep(5)
-                                continue
+                                self.logger.warning(f"视频尚未解锁，等待前置节点: {error_msg}")
+                                flag = False
+                                monitor_thread.join(timeout=1)
+                                return False
                             self.logger.error(f"学习请求失败: {error_msg}")
                             if "登录超时" in error_msg:
                                 self.token = None  # 清除token，触发重新登录
@@ -537,7 +581,8 @@ class User:
                         self.logger.info(f"准备增加学习时间: {study_time} -> {study_time + 10}")
                         study_time += 10
                         self.logger.info(f"等待10秒后继续学习")
-                        time.sleep(10)
+                        if not self._interruptible_sleep(10):
+                            break
                         
                     except requests.exceptions.RequestException as e:
                         self.logger.error(f"学习请求网络异常: {str(e)}")
@@ -559,6 +604,9 @@ class User:
         # 停止监控线程
         flag = False
         monitor_thread.join(timeout=1)
+
+        if not self.running:
+            return False
         
         self.update_status(f"视频已完成: {node_name}")
         return True
@@ -575,8 +623,7 @@ class User:
             )
             
             # 使用 ddddocr 识别验证码
-            import ddddocr
-            ocr = ddddocr.DdddOcr()
+            ocr = create_ocr()
             code = ocr.classification(response.content)
             
             self.update_status(f"验证码识别成功: {code}")
@@ -586,47 +633,179 @@ class User:
             self.logger.error(f"验证码识别失败: {str(e)}")
             return ""
 
-    def study_course(self, course: Dict) -> bool:
-        """学习整个课程"""
+    def _get_video_nodes(self, chapters: List[Dict]) -> List[Dict]:
+        """按课程原始顺序展开视频节点，并兼容嵌套子节点。"""
+        nodes = []
+        seen = set()
+
+        def collect(items):
+            for node in items or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = node.get('id')
+                if node.get('tabVideo') and node_id is not None and node_id not in seen:
+                    seen.add(node_id)
+                    nodes.append(node)
+                for key in ('nodeList', 'children', 'childList'):
+                    children = node.get(key)
+                    if isinstance(children, list):
+                        collect(children)
+
+        for chapter in chapters:
+            self.logger.info(f"当前第 {chapter.get('idx', '?')} 章: {chapter.get('name', '未知章节')}")
+            collect(chapter.get('nodeList', []))
+        return nodes
+
+    def _study_node_tracked(self, node: Dict) -> bool:
+        node_id = node.get('id')
+        node_name = node.get('name', '未知视频')
+        self._set_video_active(node_id, node_name, True)
+        try:
+            return self.study_node(node)
+        finally:
+            self._set_video_active(node_id, node_name, False)
+
+    def _study_node_batch(self, nodes: List[Dict], node_limit: int) -> bool:
+        """并行一批节点；同一批内没有前后依赖。"""
+        if not nodes:
+            return True
+        results = []
+        workers = min(node_limit, len(nodes))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f'{self.username}_nodes'
+        ) as executor:
+            futures = {
+                executor.submit(self._study_node_tracked, node): node
+                for node in nodes
+            }
+            for future in concurrent.futures.as_completed(futures):
+                node = futures[future]
+                try:
+                    results.append(future.result())
+                except Exception as e:
+                    self.logger.error(f"处理视频节点失败[{node.get('name')}]: {str(e)}")
+                    results.append(False)
+        return self.running and all(results)
+
+    def _get_node_statuses(self, nodes: List[Dict], node_limit: int) -> List[str]:
+        workers = min(node_limit, len(nodes))
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f'{self.username}_status'
+        ) as executor:
+            return list(executor.map(self.check_node_status, nodes))
+
+    def _study_nodes_auto(self, nodes: List[Dict], node_limit: int) -> bool:
+        """并行已解锁前缀，锁定节点必须等待前面的批次完成。"""
+        pending = list(nodes)
+        locked_wait_rounds = 0
+
+        while pending and self.running:
+            statuses = self._get_node_statuses(pending, node_limit)
+            ready = []
+            remaining = []
+            blocked = False
+
+            for node, status in zip(pending, statuses):
+                if status == 'completed':
+                    continue
+                if status == 'unlocked' and not blocked:
+                    ready.append(node)
+                else:
+                    # 第一个锁定或未知状态之后的节点不能提前并行。
+                    blocked = True
+                    remaining.append(node)
+
+            if ready:
+                locked_wait_rounds = 0
+                self.update_status(f"同时学习 {len(ready)} 个已解锁节点")
+                self.logger.info(f"并行已解锁节点: {[node.get('name') for node in ready]}")
+                if not self._study_node_batch(ready, node_limit):
+                    return False
+                pending = remaining
+                continue
+
+            if not remaining:
+                return True
+
+            first_status = self.check_node_status(remaining[0])
+            if first_status == 'error':
+                # 无法确认前置状态时保守降级，不直接并发后续节点。
+                self.logger.warning(f"无法确认节点状态，转为顺序处理: {remaining[0].get('name')}")
+                if not self._study_node_tracked(remaining[0]):
+                    return False
+                pending = remaining[1:]
+                locked_wait_rounds = 0
+                continue
+
+            locked_wait_rounds += 1
+            if locked_wait_rounds > 3:
+                self.logger.error(f"前置节点尚未完成，暂停本课程: {remaining[0].get('name')}")
+                return False
+            self.update_status(f"等待前置节点解锁: {remaining[0].get('name')}")
+            if not self._interruptible_sleep(5):
+                return False
+
+        return self.running
+
+    def study_course(
+        self,
+        course: Dict,
+        parallel_nodes: bool = False,
+        node_mode: str = 'auto',
+        node_limit: int = 3
+    ) -> bool:
+        """学习整个课程，可按课程选择自动前置、全部并行或严格顺序。"""
         try:
             course_name = course.get('name', '未知课程')
             course_id = course.get('id')
             if not course_id:
                 self.logger.error(f"课程数据无效: {course}")
                 return False
-                
+
             self.current_course = course_name
             self.update_status(f"开始学习课程: {course_name}")
-            
-            # 获取课程章节
             chapters = self.get_chapters(course_id)
             if not chapters:
                 return False
-            
-            # 遍历章节学习
-            for chapter in chapters:
+
+            nodes = self._get_video_nodes(chapters)
+            if not nodes:
+                self.logger.info(f"课程没有视频节点: {course_name}")
+                return True
+
+            if parallel_nodes and node_mode != 'sequential':
+                try:
+                    node_limit = max(1, min(20, int(node_limit)))
+                except (TypeError, ValueError):
+                    node_limit = 3
+
+                if node_mode == 'parallel':
+                    self.update_status(f"{course_name}: 全部节点并行 ({len(nodes)} 个)")
+                    return self._study_node_batch(nodes, node_limit)
+
+                self.update_status(f"{course_name}: 自动识别前置节点")
+                return self._study_nodes_auto(nodes, node_limit)
+
+            # 普通启动及“严格顺序”模式仍按课程原始顺序处理。
+            for node in nodes:
                 if not self.running:
-                    break
-                    
-                chapter_name = chapter.get('name', '未知章节')
-                self.logger.info(f"当前第 {chapter.get('idx', '?')} 章: {chapter_name}")
-                
-                # 遍历章节中的视频节点
-                node_list = chapter.get('nodeList', [])
-                for node in node_list:
-                    if not self.running:
-                        break
-                        
-                    # 只处理视频节点
-                    if node.get('tabVideo'):
-                        try:
-                            self.study_node(node)
-                        except Exception as e:
-                            self.logger.error(f"处理视频节点失败: {str(e)}")
-                            continue
-            
+                    return False
+                try:
+                    if parallel_nodes:
+                        success = self._study_node_tracked(node)
+                        if not success:
+                            return False
+                    else:
+                        self.study_node(node)
+                except Exception as e:
+                    self.logger.error(f"处理视频节点失败: {str(e)}")
+                    if parallel_nodes:
+                        return False
+
             return True
-            
+
         except Exception as e:
             self.logger.error(f"学习课程失败: {str(e)}")
             return False
@@ -651,24 +830,56 @@ class User:
         except Exception as e:
             self.logger.error(f"课程学习线程异常: {str(e)}")
 
-    def run(self):
-        """主运行逻辑，使用线程池处理并发"""
+    def _interruptible_sleep(self, seconds: float) -> bool:
+        """可中断的睡眠：每秒检查一次 self.running，被 stop 时立刻返回。
+        返回 True = 睡眠完整结束；False = 被 stop 打断。
+        """
+        end_time = time.time() + seconds
+        while self.running and time.time() < end_time:
+            time.sleep(min(1.0, max(0.05, end_time - time.time())))
+        return self.running
+
+    def run(
+        self,
+        parallel_nodes: bool = False,
+        course_ids: Optional[List[str]] = None,
+        course_modes: Optional[Dict[str, str]] = None,
+        node_limit: int = 3,
+        course_limit: Optional[int] = None
+    ):
+        """主运行逻辑；并行模式可限定课程，并为每门课指定节点策略。"""
         self.running = True
+        self.run_mode = 'parallel' if parallel_nodes else 'normal'
         self.update_status("开始运行")
+
+        if course_limit is not None:
+            try:
+                self.study_limit = max(1, min(10, int(course_limit)))
+            except (TypeError, ValueError):
+                pass
+        selected_ids = {str(course_id) for course_id in course_ids} if course_ids else None
+        course_modes = course_modes or {}
         
         while self.running:
             try:
                 # 登录
                 if not self.login():
                     self.update_status("登录失败，等待重试")
-                    time.sleep(60)
+                    if not self._interruptible_sleep(60):
+                        break
                     continue
                 
                 # 获取未完成课程
                 courses = self.get_courses()
+                if selected_ids is not None:
+                    courses = [
+                        course for course in courses
+                        if str(course.get('id')) in selected_ids
+                    ]
                 if not courses:
-                    self.update_status("没有未完成课程，等待重试")
-                    time.sleep(300)
+                    self.update_status("所选课程均已完成或不可用，等待重试" if selected_ids is not None else "没有未完成课程，等待重试")
+                    if not self._interruptible_sleep(300):
+                        break
                     continue
                 
                 # 使用线程池处理课程
@@ -689,24 +900,47 @@ class User:
                             continue
                             
                         self.logger.info(f"当前课程[{course.get('name')}][{course.get('id')}] 进度: {course.get('progress1', '未知')}")
-                        futures.append(executor.submit(self.study_course, course))
+                        node_mode = course_modes.get(str(course.get('id')), 'auto')
+                        futures.append(executor.submit(
+                            self.study_course,
+                            course,
+                            parallel_nodes=parallel_nodes,
+                            node_mode=node_mode,
+                            node_limit=node_limit
+                        ))
                     
-                    # 等待所有课程完成
+                    # 等待所有课程完成（可被 stop 打断）
                     for future in concurrent.futures.as_completed(futures):
+                        if not self.running:
+                            # 不再等待后续 future，立即退出
+                            break
                         try:
                             future.result()
                         except Exception as e:
                             self.logger.error(f"课程学习异常: {str(e)}")
                 
+                # 如果被 stop，不再进入下一轮等待
+                if not self.running:
+                    break
+                
                 # 完成一轮后等待
                 wait_time = random.randint(300, 600)
                 self.update_status(f"本轮完成，等待 {wait_time} 秒")
-                time.sleep(wait_time)
+                if not self._interruptible_sleep(wait_time):
+                    break
                 
             except Exception as e:
                 self.logger.error(f"运行出错: {str(e)}")
                 self.update_status("运行过程出错")
-                time.sleep(60)
+                if not self._interruptible_sleep(60):
+                    break
+        
+        # 退出循环后重置状态
+        self.current_status = "已停止"
+        self.current_course = None
+        self.current_video = None
+        with self.status_lock:
+            self.active_videos.clear()
 
     def stop(self):
         """停止运行"""
@@ -715,14 +949,20 @@ class User:
         # 等待所有学习线程结束
         for thread in self.study_threads:
             if thread.is_alive():
-                thread.join(timeout=5)
-        self.update_status("已停止")
+                thread.join(timeout=2)
+        # 状态在 run() 退出后会被设为"已停止"，这里不重复设置
+        # 避免 run() 还未退出时状态被覆盖回"已停止"造成不一致
 
     def get_status(self) -> Dict:
         """获取当前状态"""
+        with self.status_lock:
+            active_nodes = len(self.active_videos)
+            current_video = '、'.join(self.active_videos.values()) or self.current_video
         return {
             'status': self.current_status,
             'course': self.current_course,
-            'video': self.current_video,
-            'running': self.running
-        } 
+            'video': current_video,
+            'running': self.running,
+            'mode': self.run_mode,
+            'active_nodes': active_nodes
+        }

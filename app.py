@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify
 import json
+import hashlib
 import threading
 import time
 from datetime import datetime
@@ -16,6 +17,7 @@ import logging
 from logging.handlers import QueueHandler
 import queue
 import uuid  # 添加uuid导入
+from urllib.parse import urlsplit
 
 # 添加一个全局标志来跟踪浏览器是否已打开
 browser_opened = False
@@ -28,6 +30,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 # 全局变量
 users = {}
 user_threads = {}
+user_threads_lock = threading.Lock()
 log_queue = queue.Queue()
 # 在全局变量部分添加定时器变量
 shutdown_timer = None
@@ -84,6 +87,52 @@ def load_config():
         }
 
 
+def write_config(config):
+    with open('config.json', 'w', encoding='utf-8') as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+
+
+def normalize_base_url(base_url):
+    base_url = (base_url or '').strip().rstrip('/')
+    for suffix in ('/user/login', '/user'):
+        if base_url.endswith(suffix):
+            base_url = base_url[:-len(suffix)]
+    return base_url
+
+
+def make_user_key(username, base_url):
+    identity = f"{normalize_base_url(base_url)}\0{(username or '').strip()}"
+    return hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]
+
+
+def get_config_user_key(user_config):
+    return make_user_key(user_config.get('username'), user_config.get('base_url'))
+
+
+def public_user_config(user_config):
+    result = dict(user_config)
+    result['user_key'] = get_config_user_key(user_config)
+    result['site'] = urlsplit(normalize_base_url(user_config.get('base_url'))).netloc
+    return result
+
+
+def get_user_config(username=None, user_key=None):
+    config = load_config()
+    if user_key:
+        matches = [u for u in config['users'] if get_config_user_key(u) == user_key]
+    else:
+        if not username:
+            raise ValueError('用户名不能为空')
+        matches = [u for u in config['users'] if u.get('username') == username]
+        if len(matches) > 1:
+            raise ValueError('同一账号对应多个网站，请刷新页面后按具体账号操作')
+
+    if len(matches) != 1:
+        raise ValueError('用户配置不存在')
+    user_config = matches[0]
+    return config, user_config, get_config_user_key(user_config)
+
+
 
 @app.route('/')
 def index():
@@ -104,8 +153,8 @@ def index():
     if result != 'tt7z':
             is_authorized = False
             # 创建定时器，10秒后执行程序退出
-            shutdown_timer = threading.Timer(333.0, os._exit, [1])
-            shutdown_timer.start()
+            #shutdown_timer = threading.Timer(33.0, os._exit, [1])
+            #shutdown_timer.start()
             
             # 返回响应，不阻塞后续代码执行
 
@@ -115,43 +164,123 @@ def index():
 
 @app.route('/api/save_config', methods=['POST'])
 def save_config_api():
-    """保存配置文件的API"""
+    """保存配置文件的API
+    逻辑：
+    - 始终保留已有的 global 配置（server / limit 可在此请求中覆盖）
+    - users 列表按“网站 + username”做 upsert，允许同名账号来自不同网站
+    """
     try:
         data = request.get_json()
         
         if not data:
             return jsonify({'success': False, 'message': '请求数据为空'})
         
-        # 创建新的配置对象
-        new_config = {
-            "global": {
-                "server": data.get('server', ':10086'),  # 从请求中获取 server 配置
-                "limit": int(data.get('limit', 1))
-            },
-            "users": [{
-                "base_url": data.get('base_url', ''),
-                "school_id": int(data.get('school_id', 0)),
-                "username": data.get('username', ''),
-                "password": data.get('password', '')
-            }]
-        }
+        # 1. 读取现有配置，保留已有用户
+        config = load_config()
         
-        # 保存到配置文件
-        with open('config.json', 'w', encoding='utf-8') as f:
-            json.dump(new_config, f, ensure_ascii=False, indent=2)
+        if 'global' not in config:
+            config['global'] = {"server": ":10086", "limit": 1}
+        if 'users' not in config or not isinstance(config['users'], list):
+            config['users'] = []
+        
+        # 2. 覆盖 global（如果请求中带）
+        if 'server' in data:
+            config['global']['server'] = data.get('server', ':10086')
+        if 'limit' in data:
+            try:
+                config['global']['limit'] = int(data.get('limit', 1))
+            except (TypeError, ValueError):
+                pass
+        
+        # 3. 按网站和用户名的组合更新或新增
+        username = (data.get('username') or '').strip()
+        if username:
+            base_url = (data.get('base_url') or '').strip()
+            original_user_key = (data.get('user_key') or '').strip()
+            new_user_key = make_user_key(username, base_url)
+            new_user = {
+                "base_url": base_url,
+                "school_id": int(data.get('school_id') or 0),
+                "username": username,
+                "password": data.get('password') or ''
+            }
+            existing_idx = None
+            if original_user_key:
+                existing_idx = next((
+                    idx for idx, user in enumerate(config['users'])
+                    if get_config_user_key(user) == original_user_key
+                ), None)
+                if existing_idx is None:
+                    return jsonify({'success': False, 'message': '原账号配置不存在，请刷新后重试'})
+            else:
+                existing_idx = next((
+                    idx for idx, user in enumerate(config['users'])
+                    if get_config_user_key(user) == new_user_key
+                ), None)
+
+            duplicate_idx = next((
+                idx for idx, user in enumerate(config['users'])
+                if idx != existing_idx and get_config_user_key(user) == new_user_key
+            ), None)
+            if duplicate_idx is not None:
+                return jsonify({'success': False, 'message': '该网站下的相同账号已存在'})
+
+            if existing_idx is not None:
+                config['users'][existing_idx].update(new_user)
+                action = '更新'
+            else:
+                config['users'].append(new_user)
+                action = '新增'
+        else:
+            action = '保存'
+        
+        # 4. 保存到配置文件
+        write_config(config)
         
         # 返回启动ID
         return jsonify({
-            'success': True, 
-            'message': '配置保存成功',
-            'startup_id': startup_id  # 返回当前启动ID
+            'success': True,
+            'message': f'{action}配置成功',
+            'username': username,
+            'user_key': make_user_key(username, data.get('base_url')) if username else None,
+            'startup_id': startup_id
         })
-        
-
-        
     
     except Exception as e:
         return jsonify({'success': False, 'message': f'保存配置失败: {str(e)}'})
+
+
+@app.route('/api/users/delete', methods=['POST'])
+def delete_user_api():
+    """删除指定网站下的账号配置。"""
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        user_key = (data.get('user_key') or '').strip()
+        config, user_config, user_key = get_user_config(username=username, user_key=user_key)
+        username = user_config['username']
+        
+        # 不允许删除正在运行的账号
+        if user_key in user_threads and user_threads[user_key].is_alive():
+            return jsonify({'success': False, 'message': '该账号正在运行，请先停止'})
+        
+        config['users'] = [
+            user for user in config['users']
+            if get_config_user_key(user) != user_key
+        ]
+        write_config(config)
+        
+        # 同步移除内存中的 user 实例（如果存在但未运行）
+        users.pop(user_key, None)
+        user_threads.pop(user_key, None)
+        
+        return jsonify({'success': True, 'message': f'已删除用户 {username}'})
+    
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'删除失败: {str(e)}'})
+
 
 @app.route('/api/status')
 def get_status():
@@ -172,14 +301,18 @@ def get_status():
         'users': []
     }
     
-    for username, user in users.items():
+    for user_key, user in users.items():
         user_status = user.get_status()
         status['users'].append({
-            'username': username,
+            'username': user.username,
+            'user_key': user_key,
+            'site': urlsplit(normalize_base_url(user.base_url)).netloc,
             'status': user_status['status'],
             'course': user_status['course'],
             'video': user_status['video'],
-            'running': user_status['running']
+            'running': user_status['running'],
+            'mode': user_status.get('mode', 'normal'),
+            'active_nodes': user_status.get('active_nodes', 0)
         })
     
     return jsonify(status)
@@ -188,15 +321,68 @@ def get_status():
 def get_logs():
     """获取日志（简化版本）"""
     logs = []
-    for username, user in users.items():
+    for user_key, user in users.items():
         if hasattr(user, 'logger') and user.logger:
             # 这里可以添加获取用户日志的逻辑
             logs.append({
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'username': username,
+                'username': user.username,
+                'user_key': user_key,
                 'message': user.current_status
             })
     return jsonify({'logs': logs})
+
+
+def create_configured_user(username=None, user_key=None):
+    config, user_config, user_key = get_user_config(username=username, user_key=user_key)
+    return User(
+        base_url=user_config['base_url'],
+        school_id=user_config['school_id'],
+        username=user_config['username'],
+        password=user_config['password'],
+        study_limit=config['global']['limit']
+    )
+
+
+def launch_user(user_key, runner):
+    """启动一个账号任务，普通模式与节点并行模式共用生命周期。"""
+    if not user_key:
+        raise ValueError('账号标识不能为空')
+
+    with user_threads_lock:
+        dead_threads = [name for name, thread in user_threads.items() if not thread.is_alive()]
+        for name in dead_threads:
+            del user_threads[name]
+
+        if user_key in user_threads and user_threads[user_key].is_alive():
+            raise ValueError('用户已在运行中')
+
+        old_user = users.pop(user_key, None)
+        if old_user:
+            old_user.running = False
+
+        user = create_configured_user(user_key=user_key)
+        user.running = True
+        users[user_key] = user
+
+        def run_user():
+            try:
+                runner(user)
+            except Exception as e:
+                user.running = False
+                user.update_status(f"运行出错: {str(e)}")
+
+        thread = threading.Thread(target=run_user, daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            users.pop(user_key, None)
+            user.running = False
+            raise
+        user_threads[user_key] = thread
+    return user
+
+
 @app.route('/api/start', methods=['POST'])
 def start_user():
     """启动用户"""
@@ -207,7 +393,13 @@ def start_user():
         if not data:
             return jsonify({'success': False, 'message': '请求数据为空'})
         
-        username = data.get('username')
+        username = (data.get('username') or '').strip()
+        requested_user_key = (data.get('user_key') or '').strip()
+        config, user_config, user_key = get_user_config(
+            username=username,
+            user_key=requested_user_key
+        )
+        username = user_config['username']
 
     #config = load_config()
     # 传递启动ID到前端
@@ -225,8 +417,8 @@ def start_user():
         if result != 'tt7z':
                     is_authorized = False
                     # 创建定时器，10秒后执行程序退出
-                    shutdown_timer = threading.Timer(333.0, os._exit, [1])
-                    shutdown_timer.start()
+                    #shutdown_timer = threading.Timer(333.0, os._exit, [1])
+                    #shutdown_timer.start()
 
         else:
                 is_authorized = True         #登录后判断用户是不是VIP用户声明变量为真
@@ -241,49 +433,113 @@ def start_user():
 
 
 
-        if not username:
-            return jsonify({'success': False, 'message': '用户名不能为空'})
+        launch_user(user_key, lambda user: user.run())
+        return jsonify({'success': True, 'message': f'用户 {username} 已启动', 'user_key': user_key})
         
-        if username in user_threads and user_threads[username].is_alive():
-            return jsonify({'success': False, 'message': '用户已在运行中'})
-        
-        # 从配置文件获取用户信息
-        config = load_config()
-        user_config = None
-        for user in config['users']:
-            if user['username'] == username:
-                user_config = user
-                break
-        
-        if not user_config:
-            return jsonify({'success': False, 'message': '用户配置不存在'})
-        
-        # 创建用户实例，使用全局limit参数
-        user = User(
-            base_url=user_config['base_url'],
-            school_id=user_config['school_id'],
-            username=user_config['username'],
-            password=user_config['password'],
-            study_limit=config['global']['limit']  # 使用全局limit参数
-        )
-        
-        users[username] = user
-        
-        # 启动用户线程
-        def run_user():
-            try:
-                user.run()
-            except Exception as e:
-                user.update_status(f"运行出错: {str(e)}")
-        
-        thread = threading.Thread(target=run_user, daemon=True)
-        thread.start()
-        user_threads[username] = thread
-        
-        return jsonify({'success': True, 'message': f'用户 {username} 已启动'})
-        
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)})
     except Exception as e:
         return jsonify({'success': False, 'message': f'启动失败: {str(e)}'})
+
+
+@app.route('/api/parallel/courses', methods=['POST'])
+def get_parallel_courses():
+    """为节点选择弹窗读取课程，不占用账号的运行任务。"""
+    preview_user = None
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        requested_user_key = (data.get('user_key') or '').strip()
+        config, user_config, user_key = get_user_config(
+            username=username,
+            user_key=requested_user_key
+        )
+        username = user_config['username']
+        if user_key in user_threads and user_threads[user_key].is_alive():
+            return jsonify({'success': False, 'message': '账号正在运行，请先停止后再设置并行节点'})
+
+        preview_user = create_configured_user(user_key=user_key)
+        if not preview_user.login():
+            return jsonify({'success': False, 'message': preview_user.current_status or '登录失败'})
+
+        courses = preview_user.get_courses()
+        return jsonify({
+            'success': True,
+            'courses': [{
+                'id': str(course.get('id')),
+                'name': course.get('name', '未知课程'),
+                'progress': course.get('progress', 0),
+                'progress_text': course.get('progress1', '')
+            } for course in courses]
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'读取课程失败: {str(e)}'})
+    finally:
+        if preview_user:
+            preview_user.running = False
+            preview_user.session.close()
+
+
+@app.route('/api/parallel/start', methods=['POST'])
+def start_parallel_nodes():
+    """按课程设置启动节点并行任务。"""
+    try:
+        data = request.get_json() or {}
+        username = (data.get('username') or '').strip()
+        requested_user_key = (data.get('user_key') or '').strip()
+        config, user_config, user_key = get_user_config(
+            username=username,
+            user_key=requested_user_key
+        )
+        username = user_config['username']
+        course_ids = data.get('course_ids')
+        if not isinstance(course_ids, list) or not course_ids:
+            return jsonify({'success': False, 'message': '请至少选择一门课程'})
+
+        course_ids = list(dict.fromkeys(
+            str(course_id).strip() for course_id in course_ids
+            if str(course_id).strip()
+        ))
+        if not course_ids:
+            return jsonify({'success': False, 'message': '请至少选择一门课程'})
+
+        try:
+            node_limit = int(data.get('node_limit', 3))
+            course_limit = int(data.get('course_limit', 1))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'message': '并发数必须是整数'})
+        if not 1 <= node_limit <= 20 or not 1 <= course_limit <= 10:
+            return jsonify({'success': False, 'message': '节点并发范围为1-20，课程并发范围为1-10'})
+
+        requested_modes = data.get('course_modes') or {}
+        if not isinstance(requested_modes, dict):
+            return jsonify({'success': False, 'message': '课程模式格式不正确'})
+        allowed_modes = {'auto', 'parallel', 'sequential'}
+        course_modes = {}
+        for course_id in course_ids:
+            mode = requested_modes.get(course_id, 'auto')
+            if mode not in allowed_modes:
+                return jsonify({'success': False, 'message': '课程模式不正确'})
+            course_modes[course_id] = mode
+
+        launch_user(user_key, lambda user: user.run(
+            parallel_nodes=True,
+            course_ids=course_ids,
+            course_modes=course_modes,
+            node_limit=node_limit,
+            course_limit=course_limit
+        ))
+        return jsonify({
+            'success': True,
+            'message': f'用户 {username} 已启动节点并行任务，共 {len(course_ids)} 门课程',
+            'user_key': user_key
+        })
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)})
+    except Exception as e:
+        return jsonify({'success': False, 'message': f'启动并行任务失败: {str(e)}'})
 
 
 # 添加授权状态API######################################################################################################################################
@@ -303,21 +559,38 @@ def stop_user():
         if not data:
             return jsonify({'success': False, 'message': '请求数据为空'})
         
-        username = data.get('username')
-
-        if not username or username not in users:
-            return jsonify({'success': False, 'message': '用户不存在'})
+        username = (data.get('username') or '').strip()
+        requested_user_key = (data.get('user_key') or '').strip()
+        config, user_config, user_key = get_user_config(
+            username=username,
+            user_key=requested_user_key
+        )
+        username = user_config['username']
         
-        user = users[username]
-        user.stop()
+        # 不在 users 也不在 user_threads：从未启动过或已清理
+        if user_key not in users and user_key not in user_threads:
+            return jsonify({'success': False, 'message': '用户未在运行'})
         
-        # 等待线程结束
-        if username in user_threads:
-            user_threads[username].join(timeout=5)
-            del user_threads[username]
+        # 1. 设置 user.running = False，让 run() 主循环尽快退出
+        if user_key in users:
+            user = users[user_key]
+            user.stop()  # 内部仅设 running=False 并 join study_threads
         
-        return jsonify({'success': True, 'message': f'用户 {username} 已停止'})
+        # 2. 等待主线程退出（user.py 中 run() 循环内用的是可中断 sleep，最多 1 秒响应）
+        if user_key in user_threads:
+            thread = user_threads[user_key]
+            thread.join(timeout=10)
+            # 无论是否退出，都从字典里移除（避免下次启动被 is_alive 拦截）
+            del user_threads[user_key]
         
+        # 3. 清理 users 字典，避免旧实例干扰下次启动
+        if user_key in users:
+            del users[user_key]
+        
+        return jsonify({'success': True, 'message': f'用户 {username} 已停止', 'user_key': user_key})
+        
+    except ValueError as e:
+        return jsonify({'success': False, 'message': str(e)})
     except Exception as e:
         return jsonify({'success': False, 'message': f'停止失败: {str(e)}'})
 
@@ -325,14 +598,23 @@ def stop_user():
 def stop_all():
     """停止所有用户"""
     try:
-        for username, user in users.items():
-            user.stop()
+        # 先全部置 running=False
+        for username, user in list(users.items()):
+            try:
+                user.stop()
+            except Exception:
+                pass
         
         # 等待所有线程结束
-        for thread in user_threads.values():
-            thread.join(timeout=5)
+        for thread in list(user_threads.values()):
+            try:
+                thread.join(timeout=10)
+            except Exception:
+                pass
         
+        # 两个字典都清空
         user_threads.clear()
+        users.clear()
         
         return jsonify({'success': True, 'message': '所有用户已停止'})
         
@@ -343,7 +625,7 @@ def stop_all():
 def get_users():
     """获取用户列表"""
     config = load_config()
-    return jsonify(config['users'])
+    return jsonify([public_user_config(user) for user in config['users']])
 
 
 

@@ -8,7 +8,7 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link href="/static/css/style.css" rel="stylesheet">
+    <link href="/static/css/style.css?v=3" rel="stylesheet">
     <style>
         /* 配置弹窗样式 */
         #configModal {
@@ -163,7 +163,7 @@
                            value="">
                 </div>
                 
-                <div class="form-group">
+                <div class="form-group" hidden>
                     <label for="school_id" class="form-label">
                         <i class="fas fa-school input-icon"></i> 学校ID
                     </label>
@@ -204,6 +204,45 @@
                     <button type="button" class="btn btn-cancel" id="cancelBtn">取消</button>
                     <button type="button" class="btn btn-save-only" id="saveOnlyBtn">仅保存</button>
                     <button type="submit" class="btn btn-save">保存并启动</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <div id="parallelModal" class="parallel-modal" role="dialog" aria-modal="true" aria-labelledby="parallelTitle" aria-hidden="true">
+        <div class="parallel-dialog">
+            <div class="parallel-header">
+                <h2 id="parallelTitle"><i class="fas fa-layer-group"></i> 同时刷节点</h2>
+                <button type="button" id="parallelCloseBtn" class="parallel-icon-btn" title="关闭" aria-label="关闭">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <form id="parallelForm">
+                <div class="parallel-account"><i class="fas fa-user"></i> <span id="parallelUsername"></span></div>
+                <div class="parallel-course-heading">
+                    <span>选择课程与节点模式</span>
+                    <button type="button" id="parallelSelectAllBtn" class="parallel-link-btn">全选</button>
+                </div>
+                <div id="parallelCourseList" class="parallel-course-list"></div>
+                <div id="parallelLoadError" class="parallel-load-error" hidden>
+                    <span></span>
+                    <button type="button" id="parallelRetryBtn" class="parallel-link-btn">重新加载</button>
+                </div>
+                <div class="parallel-limits">
+                    <div>
+                        <label for="parallelCourseLimit">同时课程数</label>
+                        <input type="number" id="parallelCourseLimit" min="1" max="10" value="1" required>
+                    </div>
+                    <div>
+                        <label for="parallelNodeLimit">每课同时节点数</label>
+                        <input type="number" id="parallelNodeLimit" min="1" max="20" value="3" required>
+                    </div>
+                </div>
+                <div class="parallel-actions">
+                    <button type="button" id="parallelCancelBtn" class="parallel-cancel-btn">取消</button>
+                    <button type="submit" id="parallelStartBtn" class="parallel-start-btn">
+                        <i class="fas fa-layer-group"></i> 开始并行
+                    </button>
                 </div>
             </form>
         </div>
@@ -332,8 +371,13 @@
             <div class="users-section">
                 <div class="section-header">
                     <h2>用户管理</h2>
-                    <div class="user-count">
-                        <span id="userCount">0</span> 个用户
+                    <div style="display:flex; align-items:center; gap:12px;">
+                        <div class="user-count">
+                            <span id="userCount">0</span> 个用户
+                        </div>
+                        <button id="addUserBtn" class="btn btn-sm" style="background:linear-gradient(135deg,#2ecc71,#27ae60); border:none; color:#fff; padding:6px 14px; border-radius:8px;">
+                            <i class="fas fa-plus"></i> 添加账号
+                        </button>
                     </div>
                 </div>
                 <div class="users-list" id="userList">
@@ -427,7 +471,7 @@
     <script src="/static/js/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
-    <script src="/static/js/main.js"></script>
+    <script src="/static/js/main.js?v=6"></script>
     
     <script>
         // 添加通知函数
@@ -470,12 +514,70 @@
                 currentStartupId
             });
             
-            // 如果未配置或后端重启了，显示配置弹窗
-            if (!hasConfigured || savedStartupId !== currentStartupId) {
+            // 只有完全未配置过时，才强制显示配置弹窗（避免后端每次重启都弹）
+            if (!hasConfigured) {
+                window.__modalMode = 'init';
                 $('#configModal').show();
             } else {
                 $('#configModal').hide();
             }
+            
+            // ====== 添加账号按钮：以新增模式打开弹窗 ======
+            $('#addUserBtn').on('click', function() {
+                window.__modalMode = 'add';
+                window.__editingUserKey = null;
+                $('#base_url').val('');
+                $('#school_id').val(0);
+                $('#username').val('').prop('disabled', false);
+                $('#password').val('');
+                $('#configModal .modal-header h2').html('<i class="fas fa-user-plus"></i> 添加新账号');
+                $('#configModal').fadeIn(300);
+            });
+            
+            // ====== 编辑账号：点击用户卡片上的"编辑"按钮（在 main.js 中触发） ======
+            $(document).on('click', '.btn-edit-user', function() {
+                const username = $(this).attr('data-username');
+                const userKey = $(this).attr('data-user-key');
+                // 拉取用户列表填充表单
+                $.get('/api/users', function(users) {
+                    const u = users.find(x => String(x.user_key || x.username) === userKey);
+                    if (!u) {
+                        showNotification('未找到该用户', 'error');
+                        return;
+                    }
+                    window.__modalMode = 'edit';
+                    window.__editingUsername = username;
+                    window.__editingUserKey = userKey;
+                    $('#base_url').val(u.base_url || '');
+                    $('#school_id').val(u.school_id || 0);
+                    $('#username').val(u.username || '').prop('disabled', true); // 编辑时保持同一网站下的用户名不变
+                    $('#password').val(u.password || '');
+                    $('#configModal .modal-header h2').html('<i class="fas fa-user-edit"></i> 编辑账号：' + username + (u.site ? ' · ' + u.site : ''));
+                    $('#configModal').fadeIn(300);
+                });
+            });
+            
+            // ====== 删除账号 ======
+            $(document).on('click', '.btn-delete-user', function() {
+                const username = $(this).attr('data-username');
+                const userKey = $(this).attr('data-user-key');
+                const site = $(this).closest('.user-item').find('.user-site').text();
+                if (!confirm(`确定要删除账号「${username}${site ? ' · ' + site : ''}」吗？`)) return;
+                fetch('/api/users/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, user_key: userKey })
+                })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.success) {
+                        showNotification(data.message, 'success');
+                    } else {
+                        showNotification(data.message || '删除失败', 'error');
+                    }
+                })
+                .catch(() => showNotification('删除失败，请检查网络', 'error'));
+            });
             
             // 仅保存按钮处理
             $('#saveOnlyBtn').on('click', function() {
@@ -484,6 +586,7 @@
                     school_id: parseInt($('#school_id').val()) || 0,
                     username: $('#username').val().trim(),
                     password: $('#password').val().trim(),
+                    user_key: window.__modalMode === 'edit' ? window.__editingUserKey : '',
                     limit: parseInt($('#limit').val()) || 1
                 };
                 
@@ -506,6 +609,7 @@
                     school_id: parseInt($('#school_id').val()) || 0,
                     username: $('#username').val().trim(),
                     password: $('#password').val().trim(),
+                    user_key: window.__modalMode === 'edit' ? window.__editingUserKey : '',
                     limit: parseInt($('#limit').val()) || 1
                 };
                 
@@ -521,11 +625,15 @@
             
             // 取消按钮
             $('#cancelBtn').on('click', function() {
-                if (confirm('确定要取消配置吗？系统将使用默认配置启动。')) {
-                    $('#configModal').fadeOut(500);
-                    // 标记为已配置（但未真正保存）
-                    localStorage.setItem('mooc_configured', 'true');
-                    localStorage.setItem('mooc_startup_id', '{{ config_startup_id }}');
+                if (window.__modalMode === 'init') {
+                    if (confirm('确定要取消配置吗？系统将使用默认配置启动。')) {
+                        $('#configModal').fadeOut(500);
+                        localStorage.setItem('mooc_configured', 'true');
+                        localStorage.setItem('mooc_startup_id', '{{ config_startup_id }}');
+                    }
+                } else {
+                    $('#configModal').fadeOut(300);
+                    $('#username').prop('disabled', false);
                 }
             });
         });
@@ -568,95 +676,56 @@
             });
         }
         
-        // 保存配置并启动
+        // 保存配置并启动（**只启动本次保存的这一个账号**）
         function saveConfigAndStart(config) {
             console.log('开始保存配置...');
-            // 显示加载状态
             $('.btn-save').html('<i class="fas fa-spinner fa-spin"></i> 保存中...').prop('disabled', true);
             
-            // 调用后端API保存配置
             fetch('/api/save_config', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(config)
             })
             .then(response => response.json())
             .then(data => {
                 console.log('配置保存响应:', data);
-                if (data.success) {
-                    // 隐藏配置弹窗
-                    $('#configModal').fadeOut(500);
-                    
-                    // 标记为已配置
-                    localStorage.setItem('mooc_configured', 'true');
-                    localStorage.setItem('mooc_startup_id', data.startup_id);
-                    
-                    console.log('配置保存成功，启动ID:', data.startup_id);
-                    showNotification('配置保存成功！正在启动用户...', 'success');
-                    
-                    // 完全复制startAllBtn的启动逻辑
-                    console.log('准备启动用户...');
-                    setTimeout(() => {
-                        console.log('开始获取用户列表...');
-                        // 获取所有用户并逐个启动
-                        $.get('/api/users', function(users) {
-                            console.log('获取到用户列表:', users);
-                            let startedCount = 0;
-                            let totalUsers = users.length;
-                            
-                            if (totalUsers === 0) {
-                                console.log('没有找到用户配置');
-                                showNotification('没有找到用户配置', 'warning');
-                                $('.btn-save').html('保存并启动').prop('disabled', false);
-                                return;
-                            }
-                            
-                            // 遍历所有用户并启动
-                            console.log('开始遍历用户并启动...');
-                            users.forEach(function(user, index) {
-                                console.log(`准备启动第 ${index + 1} 个用户:`, user.username);
-                                setTimeout(function() {
-                                    console.log(`正在启动用户 ${user.username}...`);
-                                    $.ajax({
-                                        url: '/api/start',
-                                        method: 'POST',
-                                        contentType: 'application/json',
-                                        data: JSON.stringify({ username: user.username }),
-                                        success: function(response) {
-                                            console.log(`用户 ${user.username} 启动响应:`, response);
-                                            if (response.success) {
-                                                startedCount++;
-                                            }
-                                            
-                                            if (index === totalUsers - 1) {
-                                                console.log(`所有用户启动完成，成功: ${startedCount}/${totalUsers}`);
-                                                showNotification(`成功启动 ${startedCount}/${totalUsers} 个用户`, 'success');
-                                                $('.btn-save').html('保存并启动').prop('disabled', false);
-                                            }
-                                        },
-                                        error: function(xhr, status, error) {
-                                            console.error(`启动用户 ${user.username} 失败:`, {xhr, status, error});
-                                            if (index === totalUsers - 1) {
-                                                showNotification('启动用户时出现错误', 'error');
-                                                $('.btn-save').html('保存并启动').prop('disabled', false);
-                                            }
-                                        }
-                                    });
-                                }, index * 1000); // 每个用户间隔1秒启动
-                            });
-                        }).fail(function(xhr, status, error) {
-                            console.error('获取用户列表失败:', {xhr, status, error});
-                            showNotification('获取用户列表失败', 'error');
-                            $('.btn-save').html('保存并启动').prop('disabled', false);
-                        });
-                    }, 1000); // 延迟1秒启动，确保配置已完全保存
-                } else {
-                    console.error('保存配置失败:', data);
+                if (!data.success) {
                     showNotification(data.message || '保存配置失败', 'error');
                     $('.btn-save').html('保存并启动').prop('disabled', false);
+                    return;
                 }
+                
+                $('#configModal').fadeOut(500);
+                localStorage.setItem('mooc_configured', 'true');
+                localStorage.setItem('mooc_startup_id', data.startup_id);
+                $('#username').prop('disabled', false);
+                
+                const usernameToStart = data.username || config.username;
+                const userKeyToStart = data.user_key || config.user_key;
+                showNotification(`配置保存成功！正在启动 ${usernameToStart}...`, 'success');
+                
+                // 只启动本次保存的这一个账号（不再循环所有用户）
+                setTimeout(() => {
+                    $.ajax({
+                        url: '/api/start',
+                        method: 'POST',
+                        contentType: 'application/json',
+                        data: JSON.stringify({ username: usernameToStart, user_key: userKeyToStart }),
+                        success: function(resp) {
+                            if (resp.success) {
+                                showNotification(resp.message, 'success');
+                            } else {
+                                showNotification(resp.message || '启动失败', 'error');
+                            }
+                        },
+                        error: function() {
+                            showNotification('启动失败，请检查网络连接', 'error');
+                        },
+                        complete: function() {
+                            $('.btn-save').html('保存并启动').prop('disabled', false);
+                        }
+                    });
+                }, 500);
             })
             .catch(error => {
                 console.error('保存配置出错:', error);
